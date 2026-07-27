@@ -7,8 +7,9 @@ run-name: publication-${{ github.event.client_payload.build_id }} · ${{ github.
 # un jeton de callback et passer par les leases/coupe-feu du CMS.
 # Le template est paramétré par PUBLIC_SITE_HOST (domaine public du tenant) et
 # PUBLIC_CMS_ORIGIN (API CMS lue au build). Cloudflare Pages reste la cible
-# primaire de candidate, preuve et audit. Un tenant peut en plus publier
-# exactement la même dist sur Netlify via la variable repo NETLIFY_SITE_MAP_JSON.
+# primaire de candidate, preuve et audit. Un tenant peut en plus publier le
+# même site sur Netlify via la variable repo NETLIFY_SITE_MAP_JSON ; seules les
+# règles de canonicalisation propres à Netlify sont ajoutées après Cloudflare.
 
 on:
   repository_dispatch:
@@ -201,10 +202,6 @@ jobs:
           PUBLIC_SITE_HOST: ${{ env.HOST }}
         run: npm run build
 
-      - name: Ajouter la canonicalisation Netlify à l'artefact (opt-in)
-        if: env.NETLIFY_SITE_ID != ''
-        run: node scripts/add-netlify-canonical-redirects.mjs dist "$HOST" "$NETLIFY_TECHNICAL_HOST"
-
       - name: Ensure Cloudflare Pages project exists
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -316,10 +313,19 @@ jobs:
             -H "x-build-secret: $OWAG_BUILD_SECRET" \
             -d "$PAYLOAD"
 
+      # L'overlay contient de la syntaxe fournisseur que Cloudflare compte dans
+      # sa limite de règles dynamiques. Il ne doit donc jamais entrer dans le
+      # candidate ni dans la production Cloudflare : on l'ajoute seulement une
+      # fois leurs uploads et l'audit candidat terminés.
+      - name: Ajouter la canonicalisation Netlify à l'artefact (opt-in)
+        if: env.NETLIFY_SITE_ID != ''
+        run: node scripts/add-netlify-canonical-redirects.mjs dist "$HOST" "$NETLIFY_TECHNICAL_HOST"
+
       # Cible secondaire strictement opt-in. --no-build garantit que Netlify
-      # reçoit le répertoire dist déjà audité sur le candidate Cloudflare,
-      # sans reconstruire ni relire un snapshot CMS plus récent. La preuve OWAG
-      # ci-dessus reste exclusivement l'URL immuable Cloudflare.
+      # reçoit les mêmes fichiers de site que le candidat Cloudflare, avec le
+      # seul overlay de redirections propre au fournisseur, sans reconstruire
+      # ni relire un snapshot CMS plus récent. La preuve OWAG ci-dessus reste
+      # exclusivement l'URL immuable Cloudflare.
       - name: Deploy production → Netlify (opt-in)
         id: netlify
         if: env.NETLIFY_SITE_ID != ''
