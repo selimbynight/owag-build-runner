@@ -6,7 +6,22 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
       - name: Vérifier la disponibilité du runner
         run: echo "OWAG public runner available"
+      - name: Vérifier l'accès en lecture au frontend privé
+        uses: actions/checkout@v6
+        with:
+          repository: selimbynight/owag-astro
+          ref: main
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Vérifier le socle de publication
+        run: |
+          test -f package.json
+          test -f scripts/owag-build-callback.sh
+          test -f scripts/live-audit.mjs
+          test -f scripts/add-netlify-canonical-redirects.mjs
+          echo "Frontend privé et scripts de publication accessibles."
