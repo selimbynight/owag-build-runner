@@ -1,0 +1,434 @@
+name: build-site
+run-name: publication-${{ github.event.client_payload.build_id }} · ${{ github.event.client_payload.project }}
+
+# Build + déploiement d'UN site tenant. Déclenché exclusivement par l'app
+# owag-cms (repository_dispatch type=build-site). Il n'existe volontairement
+# aucun déclenchement manuel : toute publication doit posséder un build_id,
+# un jeton de callback et passer par les leases/coupe-feu du CMS.
+# Le template est paramétré par PUBLIC_SITE_HOST (domaine public du tenant) et
+# PUBLIC_CMS_ORIGIN (API CMS lue au build). Cloudflare Pages reste la cible
+# primaire de candidate, preuve et audit. Un tenant peut en plus publier
+# exactement la même dist sur Netlify via la variable repo NETLIFY_SITE_MAP_JSON.
+
+on:
+  repository_dispatch:
+    types: [build-site]
+
+concurrency:
+  # Le CMS coalesce déjà strictement toutes les intentions d'un tenant. Ne jamais annuler ici :
+  # une annulation laisse la clôture au callback primaire ou à son secours conditionnel.
+  group: build-${{ github.event.client_payload.project }}
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      observed_content_revision: ${{ steps.snapshot.outputs.observed_content_revision || '0' }}
+      deployment_proof: ${{ steps.deploy.outputs.url || '' }}
+      callback_status: ${{ steps.build_result.outputs.status || 'failure' }}
+      callback_delivered: ${{ steps.callback_primary.outputs.delivered || 'false' }}
+    env:
+      HOST: ${{ github.event.client_payload.host }}
+      PROJECT: ${{ github.event.client_payload.project }}
+      CMS_ORIGIN: ${{ github.event.client_payload.cms_origin }}
+      BUILD_ID: ${{ github.event.client_payload.build_id }}
+      EXPECTED_CONTENT_REVISION: ${{ github.event.client_payload.expected_content_revision }}
+      TARGET_ACCOUNT_REF: ${{ github.event.client_payload.target_account_ref }}
+      NETLIFY_SITE_MAP_JSON: ${{ vars.NETLIFY_SITE_MAP_JSON || '{}' }}
+      # Fail-safe : seul le booléen JSON true d'un repository_dispatch CMS
+      # demande le chemin contenu. Il ne sera réellement activé qu'après
+      # concordance du manifeste CMS avec celui du frontend checkouté.
+      REQUESTED_CONTENT_ONLY: ${{ github.event_name == 'repository_dispatch' && toJSON(github.event.client_payload.content_only) == 'true' && 'true' || 'false' }}
+      DISPATCH_CAPABILITIES_DIGEST: ${{ github.event.client_payload.capabilities_digest }}
+      CONTENT_ONLY: 'false'
+      OWAG_BUILD_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+    steps:
+      - name: Guard — ordre de publication OWAG obligatoire
+        run: |
+          [ "$GITHUB_EVENT_NAME" = "repository_dispatch" ] || { echo "::error::déclencheur non autorisé"; exit 1; }
+          [ "$GITHUB_RUN_ATTEMPT" = "1" ] || { echo "::error::relance GitHub interdite ; créer une nouvelle publication OWAG"; exit 1; }
+          printf '%s' "$BUILD_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::build_id OWAG positif obligatoire"; exit 1; }
+          printf '%s' "$EXPECTED_CONTENT_REVISION" | grep -Eq '^[0-9]+$' || { echo "::error::révision attendue invalide"; exit 1; }
+          printf '%s' "$HOST" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "::error::host invalide"; exit 1; }
+          printf '%s' "$PROJECT" | grep -Eq '^[A-Za-z0-9-]+$' || { echo "::error::projet invalide"; exit 1; }
+          printf '%s' "$TARGET_ACCOUNT_REF" | grep -Eq '^[0-9a-f]{32}$' || { echo "::error::identité de compte cible invalide"; exit 1; }
+          [ "$CMS_ORIGIN" = "https://app.owag.fr" ] || { echo "::error::origine CMS non autorisée"; exit 1; }
+          [ -n "$OWAG_BUILD_SECRET" ] || { echo "::error::secret preflight/callback absent"; exit 1; }
+          CALLBACK_TOKEN="$(jq -er '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$CALLBACK_TOKEN"
+          printf '%s' "$CALLBACK_TOKEN" | grep -Eq '^[A-Za-z0-9_-]{43}$' || { echo "::error::token callback absent/invalide"; exit 1; }
+
+      - name: Claim one-shot → OWAG (avant tout build)
+        run: |
+          CALLBACK_TOKEN="$(jq -er '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$CALLBACK_TOKEN"
+          PAYLOAD="$(jq -n \
+            --argjson build_id "$BUILD_ID" \
+            --arg callback_token "$CALLBACK_TOKEN" \
+            --argjson expected_content_revision "$EXPECTED_CONTENT_REVISION" \
+            --arg host "$HOST" --arg project "$PROJECT" --arg repo "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg sha "$GITHUB_SHA" \
+            '{build_id:$build_id,callback_token:$callback_token,expected_content_revision:$expected_content_revision,host:$host,project:$project,repo:$repo,run_id:$run_id,run_attempt:$run_attempt,sha:$sha}')"
+          curl --silent --show-error --fail-with-body --connect-timeout 10 --max-time 30 \
+            -X POST "$CMS_ORIGIN/api/builds/preflight" \
+            -H "Content-Type: application/json" \
+            -H "x-build-secret: $OWAG_BUILD_SECRET" \
+            -d "$PAYLOAD"
+
+      - name: Guard — compte Cloudflare réservé
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | grep -Eq '^[0-9a-f]{32}$' || { echo "::error::identité du compte Cloudflare invalide"; exit 1; }
+          [ "$CLOUDFLARE_ACCOUNT_ID" = "$TARGET_ACCOUNT_REF" ] || { echo "::error::compte Cloudflare différent du snapshot OWAG"; exit 1; }
+
+      - name: Checkout du frontend privé
+        uses: actions/checkout@v6
+        with:
+          repository: selimbynight/owag-astro
+          ref: main
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Résoudre la cible Netlify opt-in
+        run: |
+          CONFIG="$(node scripts/resolve-netlify-config.mjs "$HOST")"
+          NETLIFY_SITE_ID="$(printf '%s' "$CONFIG" | jq -er '.siteId // ""')"
+          NETLIFY_TECHNICAL_HOST="$(printf '%s' "$CONFIG" | jq -er '.technicalHost // ""')"
+          echo "NETLIFY_SITE_ID=$NETLIFY_SITE_ID" >> "$GITHUB_ENV"
+          echo "NETLIFY_TECHNICAL_HOST=$NETLIFY_TECHNICAL_HOST" >> "$GITHUB_ENV"
+          if [ -n "$NETLIFY_SITE_ID" ]; then
+            echo "Cible Netlify activée pour $HOST ($NETLIFY_TECHNICAL_HOST)."
+          else
+            echo "Aucune cible Netlify configurée pour $HOST."
+          fi
+
+      - name: Guard — secret Netlify présent quand activé
+        if: env.NETLIFY_SITE_ID != ''
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          echo "::add-mask::$NETLIFY_AUTH_TOKEN"
+          [ -n "$NETLIFY_AUTH_TOKEN" ] || {
+            echo "::error::NETLIFY_AUTH_TOKEN absent pour un tenant Netlify"
+            exit 1
+          }
+
+      - name: Guard — identité GitHub du HEAD déployé
+        run: npm run git:identity:head
+
+      - name: Guard — manifeste des données matérialisées
+        # Toujours exécuté, y compris pour une publication content_only. Ce test
+        # n'a aucune dépendance npm et empêche qu'un nouveau dataset soit lu par
+        # le template avant d'avoir été autorisé côté CMS.
+        run: node --test scripts/__tests__/publication-capabilities.test.mjs
+
+      - name: Choisir la validation selon le manifeste certifié
+        # Une divergence inter-repo ne doit ni échouer ni laisser un contenu
+        # potentiellement périmé : elle désactive seulement l'optimisation.
+        run: |
+          LOCAL_DIGEST="$(node scripts/publication-capabilities-digest.mjs)"
+          echo "LOCAL_CAPABILITIES_DIGEST=$LOCAL_DIGEST" >> "$GITHUB_ENV"
+          if [ "$REQUESTED_CONTENT_ONLY" = "true" ] \
+            && printf '%s' "$DISPATCH_CAPABILITIES_DIGEST" | grep -Eq '^[0-9a-f]{64}$' \
+            && [ "$DISPATCH_CAPABILITIES_DIGEST" = "$LOCAL_DIGEST" ]; then
+            echo "CONTENT_ONLY=true" >> "$GITHUB_ENV"
+            echo "Manifeste CMS/frontend concordant : validation contenu autorisée."
+          else
+            echo "CONTENT_ONLY=false" >> "$GITHUB_ENV"
+            if [ "$REQUESTED_CONTENT_ONLY" = "true" ]; then
+              echo "::warning::manifeste CMS/frontend absent ou différent ; validation complète fail-open"
+            fi
+          fi
+
+      - name: Guard — fraîcheur et cible du snapshot CMS
+        id: snapshot
+        run: |
+          CALLBACK_TOKEN="$(jq -er '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$CALLBACK_TOKEN"
+          [ "$CMS_ORIGIN" = "https://app.owag.fr" ] || { echo "::error::origine CMS non autorisée"; exit 1; }
+          printf '%s' "$CALLBACK_TOKEN" | grep -Eq '^[A-Za-z0-9_-]{43}$' || { echo "::error::token callback absent/invalide"; exit 1; }
+          printf '%s' "$EXPECTED_CONTENT_REVISION" | grep -Eq '^[0-9]+$' || { echo "::error::révision attendue invalide"; exit 1; }
+          CONFIG="$(curl --fail --silent --show-error --connect-timeout 10 --max-time 30 --get \
+            --data-urlencode "host=$HOST" --data-urlencode "_cb=build-$BUILD_ID" \
+            "$CMS_ORIGIN/api/public/site-config")"
+          OBSERVED="$(printf '%s' "$CONFIG" | jq -er '.data.contentRevision | select(type == "number" and floor == . and . >= 0)')"
+          [ "$OBSERVED" -ge "$EXPECTED_CONTENT_REVISION" ] || {
+            echo "::error::snapshot CMS obsolète ($OBSERVED < $EXPECTED_CONTENT_REVISION)"
+            exit 1
+          }
+          echo "OBSERVED_CONTENT_REVISION=$OBSERVED" >> "$GITHUB_ENV"
+          echo "observed_content_revision=$OBSERVED" >> "$GITHUB_OUTPUT"
+
+      - name: Guard — pas de marqueur de câblage CMS non résolu (G-STUB)
+        # Un site qui n'a jamais fini son câblage CMS (stub laissé par erreur)
+        # ne doit jamais partir en build. Motifs CIBLÉS sur le câblage CMS non
+        # résolu (pas les mots génériques \btodo\b/\bhack\b/\bstub\b : ils
+        # feraient échouer TOUS les builds tenant au premier commentaire // TODO
+        # légitime du template partagé). Arbre vérifié propre (0 hit).
+        run: |
+          TARGETS="src"
+          [ -d scripts ] && TARGETS="$TARGETS scripts"
+          if grep -rniE "brancher le cms|stub cms|v2 ?: ?brancher|TODO.*cms|FIXME.*cms" $TARGETS; then
+            echo "::error::Marqueur de câblage CMS non résolu détecté dans le code — build bloqué (G-STUB)."
+            exit 1
+          fi
+          echo "G-STUB: aucun marqueur de stub, build autorisé."
+
+      # Les gardes sans dépendances passent avant l'installation : un payload
+      # invalide ou obsolète échoue sans consommer le coût d'un npm ci.
+      - run: npm ci
+
+      - name: Tests frontend (release de code)
+        # Le code de ce workflow reste intégralement testé pour une release de
+        # code. Une publication de contenu conserve plus bas
+        # l'audit exhaustif de l'artefact candidat.
+        if: env.CONTENT_ONLY != 'true'
+        run: npm test
+
+      - name: Build (Astro)
+        env:
+          PUBLIC_CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
+          PUBLIC_SITE_HOST: ${{ env.HOST }}
+        run: npm run build
+
+      - name: Ajouter la canonicalisation Netlify à l'artefact (opt-in)
+        if: env.NETLIFY_SITE_ID != ''
+        run: node scripts/add-netlify-canonical-redirects.mjs dist "$HOST" "$NETLIFY_TECHNICAL_HOST"
+
+      - name: Ensure Cloudflare Pages project exists
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        # Auto-crée le projet CF Pages au 1er build d'un nouveau client (sinon
+        # "Project not found"). Idempotent : ne touche rien si le projet existe déjà.
+        run: |
+          printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | grep -Eq '^[0-9a-f]{32}$' || { echo "::error::identité du compte Cloudflare invalide"; exit 1; }
+          [ "$CLOUDFLARE_ACCOUNT_ID" = "$TARGET_ACCOUNT_REF" ] || { echo "::error::compte Cloudflare différent du snapshot OWAG"; exit 1; }
+          npm exec wrangler -- pages project create "$PROJECT" --production-branch=main || echo "projet déjà existant, on continue"
+
+      # Publier d'abord le même artefact sur une URL immuable de prévisualisation.
+      # Si le crawl live échoue, la production précédente reste intacte.
+      - name: Deploy candidate → Cloudflare Pages
+        id: candidate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          [ "$CLOUDFLARE_ACCOUNT_ID" = "$TARGET_ACCOUNT_REF" ] || { echo "::error::compte Cloudflare différent du snapshot OWAG"; exit 1; }
+          LOG="$(mktemp)"
+          npm exec wrangler -- pages deploy dist --project-name="$PROJECT" --branch=owag-release-candidate \
+            --commit-hash="$GITHUB_SHA" --commit-message="owag-candidate-$BUILD_ID-run-$GITHUB_RUN_ID" \
+            --commit-dirty=true 2>&1 | tee "$LOG"
+          DEPLOY_URL="$(grep -F 'Deployment complete!' "$LOG" | grep -Eo 'https://[[:alnum:]-]+\.[[:alnum:]-]+\.pages\.dev' | tail -1)"
+          [ -n "$DEPLOY_URL" ] || { echo "::error::URL immuable Pages introuvable dans la sortie Wrangler"; exit 1; }
+          echo "url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Résoudre l’origine candidate à auditer
+        id: audit-origin
+        env:
+          DEPLOY_URL: ${{ steps.candidate.outputs.url }}
+        run: |
+          CONFIG="$(curl --fail --silent --show-error --get --data-urlencode "host=$HOST" "$CMS_ORIGIN/api/public/site-config")"
+          echo "$CONFIG" | jq -e '.success == true and (.data.canonicalBase | startswith("https://"))' >/dev/null
+          echo "base_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          echo "pages_url=https://$PROJECT.pages.dev" >> "$GITHUB_OUTPUT"
+
+      - name: Audit live du candidate
+        env:
+          BASE_URL: ${{ steps.audit-origin.outputs.base_url }}
+          PAGES_URL: ${{ steps.audit-origin.outputs.pages_url }}
+          SITE_HOST: ${{ env.HOST }}
+          CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
+          AUDIT_PHASE: candidate
+        run: node scripts/live-audit.mjs
+
+      - name: Intention OWAG + deploy production → Cloudflare Pages
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # Garder l'intention et Wrangler dans le même step réduit au minimum la fenêtre
+          # inter-systèmes. Après le 2xx, toute interruption est réconciliée sans retry aveugle.
+          [ -d dist ] && [ -n "$(find dist -type f -print -quit)" ] || { echo "::error::artefact dist absent/vide"; exit 1; }
+          [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::identifiants Cloudflare incomplets"; exit 1; }
+          printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | grep -Eq '^[0-9a-f]{32}$' || { echo "::error::identité du compte Cloudflare invalide"; exit 1; }
+          [ "$CLOUDFLARE_ACCOUNT_ID" = "$TARGET_ACCOUNT_REF" ] || { echo "::error::compte Cloudflare différent du snapshot OWAG"; exit 1; }
+          LOG="$(mktemp)"
+          trap 'rm -f "$LOG"' EXIT
+          CALLBACK_TOKEN="$(jq -er '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$CALLBACK_TOKEN"
+          INTENT_PAYLOAD="$(jq -n \
+            --argjson build_id "$BUILD_ID" \
+            --arg callback_token "$CALLBACK_TOKEN" \
+            --argjson expected_content_revision "$EXPECTED_CONTENT_REVISION" \
+            --arg host "$HOST" --arg project "$PROJECT" --arg repo "$GITHUB_REPOSITORY" \
+            --arg account_ref "$CLOUDFLARE_ACCOUNT_ID" \
+            --arg run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg sha "$GITHUB_SHA" \
+            '{build_id:$build_id,callback_token:$callback_token,expected_content_revision:$expected_content_revision,host:$host,project:$project,repo:$repo,account_ref:$account_ref,run_id:$run_id,run_attempt:$run_attempt,sha:$sha}')"
+          curl --silent --show-error --fail-with-body --connect-timeout 10 --max-time 30 \
+            -X POST "$CMS_ORIGIN/api/builds/deployment-intent" \
+            -H "Content-Type: application/json" \
+            -H "x-build-secret: $OWAG_BUILD_SECRET" \
+            -d "$INTENT_PAYLOAD"
+          npm exec wrangler -- pages deploy dist --project-name="$PROJECT" --branch=main \
+            --commit-hash="$GITHUB_SHA" \
+            --commit-message="owag-build:$BUILD_ID:revision:$EXPECTED_CONTENT_REVISION:run:$GITHUB_RUN_ID" \
+            --commit-dirty=true 2>&1 | tee "$LOG"
+          DEPLOY_URL="$(grep -F 'Deployment complete!' "$LOG" | grep -Eo 'https://[[:alnum:]-]+\.[[:alnum:]-]+\.pages\.dev' | tail -1)"
+          [ -n "$DEPLOY_URL" ] || { echo "::error::URL immuable Pages introuvable dans la sortie Wrangler"; exit 1; }
+          echo "url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+
+      # Écrit la preuve immédiatement après la frontière irréversible. Si le workflow est annulé
+      # pendant l'attente ou l'audit, OWAG sait déjà qu'une production existe et interdit un retry.
+      - name: Mémoriser la frontière de production dans OWAG
+        env:
+          DEPLOYMENT_PROOF: ${{ steps.deploy.outputs.url }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | grep -Eq '^[0-9a-f]{32}$' || { echo "::error::identité du compte Cloudflare invalide"; exit 1; }
+          [ "$CLOUDFLARE_ACCOUNT_ID" = "$TARGET_ACCOUNT_REF" ] || { echo "::error::compte Cloudflare différent du snapshot OWAG"; exit 1; }
+          CALLBACK_TOKEN="$(jq -er '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$CALLBACK_TOKEN"
+          PAYLOAD="$(jq -n \
+            --argjson build_id "$BUILD_ID" \
+            --arg callback_token "$CALLBACK_TOKEN" \
+            --argjson expected_content_revision "$EXPECTED_CONTENT_REVISION" \
+            --arg host "$HOST" --arg project "$PROJECT" --arg repo "$GITHUB_REPOSITORY" \
+            --arg account_ref "$CLOUDFLARE_ACCOUNT_ID" \
+            --arg run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg sha "$GITHUB_SHA" --arg deployment_proof "$DEPLOYMENT_PROOF" \
+            '{build_id:$build_id,callback_token:$callback_token,expected_content_revision:$expected_content_revision,host:$host,project:$project,repo:$repo,account_ref:$account_ref,run_id:$run_id,run_attempt:$run_attempt,sha:$sha,deployment_proof:$deployment_proof}')"
+          curl --silent --show-error --fail-with-body --connect-timeout 10 --max-time 30 \
+            -X POST "$CMS_ORIGIN/api/builds/deployment-boundary" \
+            -H "Content-Type: application/json" \
+            -H "x-build-secret: $OWAG_BUILD_SECRET" \
+            -d "$PAYLOAD"
+
+      # Cible secondaire strictement opt-in. --no-build garantit que Netlify
+      # reçoit le répertoire dist déjà audité sur le candidate Cloudflare,
+      # sans reconstruire ni relire un snapshot CMS plus récent. La preuve OWAG
+      # ci-dessus reste exclusivement l'URL immuable Cloudflare.
+      - name: Deploy production → Netlify (opt-in)
+        id: netlify
+        if: env.NETLIFY_SITE_ID != ''
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          OUTPUT="$(mktemp)"
+          trap 'rm -f "$OUTPUT"' EXIT
+          echo "::add-mask::$NETLIFY_AUTH_TOKEN"
+          npx --yes netlify-cli@27.0.1 deploy \
+            --dir=dist \
+            --no-build \
+            --prod \
+            --json \
+            --site="$NETLIFY_SITE_ID" \
+            --message="OWAG build $BUILD_ID / GitHub $GITHUB_SHA" > "$OUTPUT"
+          NETLIFY_RELEASE_URL="$(node scripts/resolve-netlify-deploy.mjs \
+            "$OUTPUT" "$NETLIFY_SITE_ID" "$NETLIFY_TECHNICAL_HOST")"
+          echo "url=$NETLIFY_RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "Déploiement Netlify immuable attesté : $NETLIFY_RELEASE_URL"
+
+      # La propagation du domaine public peut avancer route par route :
+      # l'accueil peut être à jour avant robots.txt, les sitemaps ou certaines
+      # pages. Deux passes multi-URL consécutives sont donc requises avant
+      # l'audit exhaustif du vrai domaine. La source immuable est Cloudflare par
+      # défaut, ou le permalink Netlify quand cette cible est activée.
+      - name: Attendre la promotion sur le domaine canonique
+        env:
+          DEPLOY_URL: ${{ steps.netlify.outputs.url || steps.deploy.outputs.url }}
+          SITE_HOST: ${{ env.HOST }}
+          CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
+          READY_MAX_ATTEMPTS: 36
+          READY_INTERVAL_MS: 5000
+          READY_CONSECUTIVE_PASSES: 2
+        run: node scripts/wait-production-ready.mjs
+
+      # Cette passe reste obligatoire même pour content_only : la gate de
+      # convergence ne sonde pas les sources des redirections CMS et ne peut
+      # donc pas remplacer l'audit exhaustif du domaine public.
+      - name: Audit live post-production
+        env:
+          BASE_URL: https://${{ env.HOST }}
+          PAGES_URL: ${{ steps.audit-origin.outputs.pages_url }}
+          NETLIFY_TECHNICAL_HOST: ${{ env.NETLIFY_TECHNICAL_HOST }}
+          SITE_HOST: ${{ env.HOST }}
+          CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
+          AUDIT_PHASE: production
+          # Une POP Cloudflare peut encore servir une route ancienne juste après
+          # les deux passes ETag de la gate. L'audit complet est donc rejoué sur
+          # une fenêtre courte ; la dernière erreur reste bloquante.
+          LIVE_AUDIT_MAX_ATTEMPTS: 4
+          LIVE_AUDIT_RETRY_DELAY_MS: 10000
+        run: node scripts/retry-live-audit.mjs
+
+      # Capture le résultat AVANT le callback. Si la livraison du callback échoue alors que le
+      # déploiement est sain, le secours doit renvoyer success, pas transformer ce succès en error.
+      - name: Capturer le résultat du build
+        id: build_result
+        if: ${{ always() }}
+        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+
+      # Chemin normal sans seconde VM : économise la minute entière que GitHub arrondissait pour
+      # chaque ancien job callback de quelques secondes. En cas de timeout/perte de runner avant
+      # cette étape, callback_delivered reste false et le job de secours prend le relais.
+      - name: Callback primaire → owag-cms
+        id: callback_primary
+        if: ${{ always() }}
+        env:
+          SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+          OBSERVED_CONTENT_REVISION: ${{ steps.snapshot.outputs.observed_content_revision || '0' }}
+          DEPLOYMENT_PROOF: ${{ steps.deploy.outputs.url || '' }}
+          JOB_STATUS: ${{ steps.build_result.outputs.status || 'failure' }}
+        run: |
+          # Si checkout n'a pas été atteint (guard/preflight en échec), le secours fera son propre
+          # checkout. Aucun terminal n'est inventé depuis un script absent.
+          [ -f scripts/owag-build-callback.sh ] || {
+            echo "::error::script callback indisponible ; secours requis"
+            exit 1
+          }
+          bash scripts/owag-build-callback.sh
+          echo "delivered=true" >> "$GITHUB_OUTPUT"
+
+  callback-rescue:
+    name: Secours callback OWAG
+    needs: build-deploy
+    # Aucun runner et aucune minute facturée lorsque le callback primaire a répondu 2xx.
+    # La seconde VM ne démarre que pour timeout, perte de runner ou livraison réellement échouée.
+    if: ${{ always() && needs.build-deploy.outputs.callback_delivered != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+      CMS_ORIGIN: ${{ github.event.client_payload.cms_origin }}
+      BUILD_ID: ${{ github.event.client_payload.build_id }}
+      EXPECTED_CONTENT_REVISION: ${{ github.event.client_payload.expected_content_revision }}
+      OBSERVED_CONTENT_REVISION: ${{ needs.build-deploy.outputs.observed_content_revision || '0' }}
+      DEPLOYMENT_PROOF: ${{ needs.build-deploy.outputs.deployment_proof || '' }}
+      HOST: ${{ github.event.client_payload.host }}
+      PROJECT: ${{ github.event.client_payload.project }}
+      TARGET_ACCOUNT_REF: ${{ github.event.client_payload.target_account_ref }}
+      JOB_STATUS: ${{ needs.build-deploy.outputs.callback_status || 'failure' }}
+    steps:
+      - name: Checkout du frontend privé pour le secours
+        uses: actions/checkout@v6
+        with:
+          repository: selimbynight/owag-astro
+          ref: main
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Callback de secours → owag-cms
+        run: bash scripts/owag-build-callback.sh
