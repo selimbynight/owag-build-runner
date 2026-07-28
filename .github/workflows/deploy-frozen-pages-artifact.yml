@@ -1,0 +1,310 @@
+name: Deploy frozen Cloudflare Pages artifact
+
+run-name: frozen-plump-com-${{ inputs.mode }} · ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Immutable owag-astro commit containing the frozen artifact
+        required: true
+        default: f05fa059d47c0773a3b5d8743b89c5a8b6100e80
+        type: string
+      mode:
+        description: Candidate only, or candidate then production
+        required: true
+        default: candidate
+        type: choice
+        options:
+          - candidate
+          - production
+      confirmation:
+        description: For production, type the exact public domain
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frozen-plumpfluffycubs-com
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HOST: plumpfluffycubs.com
+      PROJECT: plumpfluffycubs-fr
+      EXPECTED_ACCOUNT_REF: 040ae7335c5496fc190d895ea3b0f310
+      EXPECTED_ARTIFACT_REF: f05fa059d47c0773a3b5d8743b89c5a8b6100e80
+      ARTIFACT_DIR: source/frozen-artifacts/plump-com-20260728
+      WRANGLER_VERSION: 4.114.0
+      CMS_ORIGIN: https://app.owag.fr
+    steps:
+      - name: Guard — immutable target and explicit production confirmation
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          MODE: ${{ inputs.mode }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_ref must be a full immutable commit SHA"
+            exit 2
+          }
+          [[ "$SOURCE_REF" = "$EXPECTED_ARTIFACT_REF" ]] || {
+            echo "::error::source_ref is not the reviewed Plump .com artifact"
+            exit 2
+          }
+          [[ "$MODE" = candidate || "$MODE" = production ]] || {
+            echo "::error::invalid deployment mode"
+            exit 2
+          }
+          if [[ "$MODE" = production && "$CONFIRMATION" != "$HOST" ]]; then
+            echo "::error::production requires the exact confirmation: $HOST"
+            exit 2
+          fi
+
+      - name: Checkout private immutable artifact
+        uses: actions/checkout@v6
+        with:
+          repository: selimbynight/owag-astro
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: source
+
+      - name: Guard — checkout and Cloudflare account identity
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C source rev-parse HEAD)" = "$SOURCE_REF" ]] || {
+            echo "::error::checkout differs from the requested immutable SHA"
+            exit 2
+          }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" = "$EXPECTED_ACCOUNT_REF" ]] || {
+            echo "::error::Cloudflare account is not the reserved cf01 account"
+            exit 2
+          }
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || {
+            echo "::error::Cloudflare API token is missing"
+            exit 2
+          }
+
+      - name: Verify and extract the frozen production bytes
+        id: artifact
+        run: |
+          set -euo pipefail
+          manifest="$ARTIFACT_DIR/manifest.json"
+          archive="$ARTIFACT_DIR/artifact.tar.gz"
+          checksums="$ARTIFACT_DIR/FILES.sha256"
+          [[ -f "$manifest" && -f "$archive" && -f "$checksums" ]] || {
+            echo "::error::frozen artifact is incomplete"
+            exit 2
+          }
+
+          jq -e \
+            --arg host "$HOST" \
+            --arg project "$PROJECT" \
+            --arg account "$EXPECTED_ACCOUNT_REF" \
+            '.schemaVersion == 1
+             and .publicHost == $host
+             and .canonicalBase == ("https://" + $host)
+             and .cloudflareProject == $project
+             and .cloudflareAccountRef == $account
+             and .cmsRevision == 14
+             and .fileCount == 397
+             and .distFileCount == 394
+             and .functionFileCount == 3
+             and .cmsLedger == false' \
+            "$manifest" >/dev/null
+
+          expected_archive="$(jq -er '.archiveSha256' "$manifest")"
+          actual_archive="$(sha256sum "$archive" | awk '{print $1}')"
+          [[ "$actual_archive" = "$expected_archive" ]] || {
+            echo "::error::archive SHA-256 mismatch"
+            exit 2
+          }
+
+          expected_manifest="$(jq -er '.fileManifestSha256' "$manifest")"
+          actual_manifest="$(sha256sum "$checksums" | awk '{print $1}')"
+          [[ "$actual_manifest" = "$expected_manifest" ]] || {
+            echo "::error::file manifest SHA-256 mismatch"
+            exit 2
+          }
+
+          if tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.($|\/)/ { bad=1 } END { exit bad ? 0 : 1 }'; then
+            echo "::error::archive contains an unsafe path"
+            exit 2
+          fi
+          if tar -tvzf "$archive" | awk 'substr($1,1,1)!="-" && substr($1,1,1)!="d" { bad=1 } END { exit bad ? 0 : 1 }'; then
+            echo "::error::archive contains a link or unsupported entry"
+            exit 2
+          fi
+
+          mkdir site
+          tar -xzf "$archive" -C site
+          cp "$checksums" site/FILES.sha256
+          (cd site && sha256sum --check FILES.sha256 >/dev/null)
+
+          [[ "$(find site/dist -type f | wc -l | tr -d ' ')" = 394 ]]
+          [[ "$(find site/functions -type f | wc -l | tr -d ' ')" = 3 ]]
+
+          expected_home="$(jq -er '.homepageSha256' "$manifest")"
+          actual_home="$(sha256sum site/dist/index.html | awk '{print $1}')"
+          [[ "$actual_home" = "$expected_home" ]] || {
+            echo "::error::homepage differs from the reviewed .com production"
+            exit 2
+          }
+
+          jq -e \
+            '.version == 1
+             and .include == ["/lips", "/lips/*", "/htvl14475.php"]
+             and .exclude == []' \
+            site/dist/_routes.json >/dev/null
+
+          echo "archive_sha=$actual_archive" >> "$GITHUB_OUTPUT"
+          echo "manifest_sha=$actual_manifest" >> "$GITHUB_OUTPUT"
+          echo "homepage_sha=$actual_home" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Compile the frozen Pages Functions
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          cd site
+          npx --yes "wrangler@$WRANGLER_VERSION" pages functions build \
+            --outdir=/tmp/plump-frozen-functions
+
+      - name: Deploy immutable candidate
+        id: candidate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          (
+            cd site
+            npx --yes "wrangler@$WRANGLER_VERSION" pages deploy dist \
+              --project-name="$PROJECT" \
+              --branch=owag-frozen-candidate \
+              --commit-hash="$SOURCE_REF" \
+              --commit-message="frozen-plump-com-candidate-$GITHUB_RUN_ID" \
+              --commit-dirty=true
+          ) 2>&1 | tee "$log"
+          url="$(grep -F 'Deployment complete!' "$log" \
+            | grep -Eo 'https://[[:alnum:]-]+\.[[:alnum:]-]+\.pages\.dev' \
+            | tail -1)"
+          [[ -n "$url" ]] || {
+            echo "::error::immutable Pages candidate URL was not found"
+            exit 2
+          }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Audit candidate against the `.com` CMS contract
+        env:
+          BASE_URL: ${{ steps.candidate.outputs.url }}
+          PAGES_URL: https://plumpfluffycubs-fr.pages.dev
+          SITE_HOST: plumpfluffycubs.com
+          CMS_ORIGIN: https://app.owag.fr
+          AUDIT_PHASE: candidate
+          EXPECTED_HOME_SHA: ${{ steps.artifact.outputs.homepage_sha }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error "$BASE_URL/" --output /tmp/candidate-home.html
+          [[ "$(sha256sum /tmp/candidate-home.html | awk '{print $1}')" = "$EXPECTED_HOME_SHA" ]] || {
+            echo "::error::candidate homepage bytes differ from current .com production"
+            exit 2
+          }
+          node source/scripts/live-audit.mjs
+
+      - name: Deploy the audited bytes to the Pages production branch
+        if: ${{ inputs.mode == 'production' }}
+        id: production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          (
+            cd site
+            npx --yes "wrangler@$WRANGLER_VERSION" pages deploy dist \
+              --project-name="$PROJECT" \
+              --branch=main \
+              --commit-hash="$SOURCE_REF" \
+              --commit-message="frozen-plump-com-production-$GITHUB_RUN_ID" \
+              --commit-dirty=true
+          ) 2>&1 | tee "$log"
+          url="$(grep -F 'Deployment complete!' "$log" \
+            | grep -Eo 'https://[[:alnum:]-]+\.[[:alnum:]-]+\.pages\.dev' \
+            | tail -1)"
+          [[ -n "$url" ]] || {
+            echo "::error::immutable Pages production URL was not found"
+            exit 2
+          }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Re-audit the immutable production deployment
+        if: ${{ inputs.mode == 'production' }}
+        env:
+          BASE_URL: ${{ steps.production.outputs.url }}
+          PAGES_URL: https://plumpfluffycubs-fr.pages.dev
+          SITE_HOST: plumpfluffycubs.com
+          CMS_ORIGIN: https://app.owag.fr
+          AUDIT_PHASE: candidate
+          EXPECTED_HOME_SHA: ${{ steps.artifact.outputs.homepage_sha }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error "$BASE_URL/" --output /tmp/production-home.html
+          [[ "$(sha256sum /tmp/production-home.html | awk '{print $1}')" = "$EXPECTED_HOME_SHA" ]] || {
+            echo "::error::production homepage bytes differ from current .com production"
+            exit 2
+          }
+          node source/scripts/live-audit.mjs
+
+      - name: Record the immutable migration evidence
+        if: ${{ always() }}
+        env:
+          MODE: ${{ inputs.mode }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          CANDIDATE_URL: ${{ steps.candidate.outputs.url }}
+          PRODUCTION_URL: ${{ steps.production.outputs.url }}
+          ARCHIVE_SHA: ${{ steps.artifact.outputs.archive_sha }}
+          MANIFEST_SHA: ${{ steps.artifact.outputs.manifest_sha }}
+          HOME_SHA: ${{ steps.artifact.outputs.homepage_sha }}
+        run: |
+          {
+            echo "### Frozen Plump \`.com\` Cloudflare deployment"
+            echo
+            echo "- Public/canonical host: \`$HOST\`"
+            echo "- Internal Pages project: \`$PROJECT\`"
+            echo "- Mode: \`$MODE\`"
+            echo "- Immutable source ref: \`$SOURCE_REF\`"
+            echo "- Archive SHA-256: \`$ARCHIVE_SHA\`"
+            echo "- File manifest SHA-256: \`$MANIFEST_SHA\`"
+            echo "- Homepage SHA-256: \`$HOME_SHA\`"
+            echo "- Candidate: \`$CANDIDATE_URL\`"
+            if [[ -n "$PRODUCTION_URL" ]]; then
+              echo "- Production: \`$PRODUCTION_URL\`"
+            fi
+            echo
+            echo "No DNS or public-domain change is performed by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
