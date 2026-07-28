@@ -1,0 +1,86 @@
+name: Export Plump Netlify DNS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HOST: plumpfluffycubs.com
+    steps:
+      - name: Export the complete Netlify DNS zone
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$NETLIFY_AUTH_TOKEN" ]] || {
+            echo "::error::NETLIFY_AUTH_TOKEN is missing"
+            exit 2
+          }
+          mkdir -p export
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            https://api.netlify.com/api/v1/dns_zones \
+            --output /tmp/zones.json
+
+          zone_count="$(jq --arg host "$HOST" \
+            '[.[] | select(.name == $host)] | length' /tmp/zones.json)"
+          [[ "$zone_count" = 1 ]] || {
+            echo "::error::expected one Netlify DNS zone for $HOST, got $zone_count"
+            exit 2
+          }
+          zone_id="$(jq -er --arg host "$HOST" \
+            '.[] | select(.name == $host) | .id' /tmp/zones.json)"
+
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            "https://api.netlify.com/api/v1/dns_zones/$zone_id" \
+            --output /tmp/zone.json
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            "https://api.netlify.com/api/v1/dns_zones/$zone_id/dns_records" \
+            --output /tmp/records.json
+
+          jq -S 'del(.account_slug, .account_name)' /tmp/zone.json \
+            > export/zone.json
+          jq -S 'sort_by(.hostname, .type, .value)' /tmp/records.json \
+            > export/records.json
+          {
+            sha256sum export/zone.json
+            sha256sum export/records.json
+          } > export/SHA256SUMS
+          jq -n \
+            --arg host "$HOST" \
+            --arg zone_id "$zone_id" \
+            --arg exported_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --argjson record_count "$(jq 'length' export/records.json)" \
+            --argjson record_types "$(jq '[.[].type] | unique' export/records.json)" \
+            '{
+              host: $host,
+              netlifyZoneId: $zone_id,
+              exportedAt: $exported_at,
+              recordCount: $record_count,
+              recordTypes: $record_types
+            }' > export/manifest.json
+
+          {
+            echo "### Netlify DNS export"
+            echo
+            echo "- Host: \`$HOST\`"
+            echo "- Records: \`$(jq 'length' export/records.json)\`"
+            echo "- Types: \`$(jq -r '[.[].type] | unique | join(\", \")' export/records.json)\`"
+            echo "- Artifact contains the complete zone export and SHA-256 checksums."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the immutable DNS export
+        uses: actions/upload-artifact@v6
+        with:
+          name: plump-netlify-dns-${{ github.run_id }}
+          path: export/
+          if-no-files-found: error
+          retention-days: 14
