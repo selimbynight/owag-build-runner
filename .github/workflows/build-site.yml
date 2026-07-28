@@ -360,6 +360,7 @@ jobs:
           READY_MAX_ATTEMPTS: 36
           READY_INTERVAL_MS: 5000
           READY_CONSECUTIVE_PASSES: 2
+          READY_FETCH_TIMEOUT_MS: 10000
         run: node scripts/wait-production-ready.mjs
 
       # Cette passe reste obligatoire même pour content_only : la gate de
