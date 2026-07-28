@@ -227,12 +227,14 @@ jobs:
             /lips/owag-confirmed-spam-probe
             /htvl14475.php
           )
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             ready=true
             for route in "${routes[@]}"; do
               code="$(curl --silent --show-error --output /dev/null \
+                --header 'Cache-Control: no-cache, no-store' \
+                --header 'Pragma: no-cache' \
                 --write-out '%{http_code}' \
-                "$BASE_URL$route?__owag_propagation=$GITHUB_RUN_ID-$attempt")"
+                "$BASE_URL$route")"
               if [[ "$code" != 410 ]]; then
                 ready=false
                 break
@@ -244,7 +246,7 @@ jobs:
             fi
             sleep 3
           done
-          echo "::error::candidate Functions did not propagate within 90 seconds"
+          echo "::error::candidate Functions did not propagate within 180 seconds"
           exit 2
 
       - name: Audit candidate against the `.com` CMS contract
@@ -305,12 +307,14 @@ jobs:
             /lips/owag-confirmed-spam-probe
             /htvl14475.php
           )
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             ready=true
             for route in "${routes[@]}"; do
               code="$(curl --silent --show-error --output /dev/null \
+                --header 'Cache-Control: no-cache, no-store' \
+                --header 'Pragma: no-cache' \
                 --write-out '%{http_code}' \
-                "$BASE_URL$route?__owag_propagation=$GITHUB_RUN_ID-$attempt")"
+                "$BASE_URL$route")"
               if [[ "$code" != 410 ]]; then
                 ready=false
                 break
@@ -322,7 +326,7 @@ jobs:
             fi
             sleep 3
           done
-          echo "::error::production Functions did not propagate within 90 seconds"
+          echo "::error::production Functions did not propagate within 180 seconds"
           exit 2
 
       - name: Re-audit the immutable production deployment
