@@ -216,6 +216,37 @@ jobs:
           }
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
+      - name: Wait for candidate Functions propagation
+        env:
+          BASE_URL: ${{ steps.candidate.outputs.url }}
+        run: |
+          set -euo pipefail
+          routes=(
+            /lips
+            /lips/
+            /lips/owag-confirmed-spam-probe
+            /htvl14475.php
+          )
+          for attempt in $(seq 1 30); do
+            ready=true
+            for route in "${routes[@]}"; do
+              code="$(curl --silent --show-error --output /dev/null \
+                --write-out '%{http_code}' \
+                "$BASE_URL$route?__owag_propagation=$GITHUB_RUN_ID-$attempt")"
+              if [[ "$code" != 410 ]]; then
+                ready=false
+                break
+              fi
+            done
+            if [[ "$ready" = true ]]; then
+              echo "Candidate Functions are active on all four 410 probes."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::candidate Functions did not propagate within 90 seconds"
+          exit 2
+
       - name: Audit candidate against the `.com` CMS contract
         env:
           BASE_URL: ${{ steps.candidate.outputs.url }}
@@ -261,6 +292,38 @@ jobs:
             exit 2
           }
           echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for production Functions propagation
+        if: ${{ inputs.mode == 'production' }}
+        env:
+          BASE_URL: ${{ steps.production.outputs.url }}
+        run: |
+          set -euo pipefail
+          routes=(
+            /lips
+            /lips/
+            /lips/owag-confirmed-spam-probe
+            /htvl14475.php
+          )
+          for attempt in $(seq 1 30); do
+            ready=true
+            for route in "${routes[@]}"; do
+              code="$(curl --silent --show-error --output /dev/null \
+                --write-out '%{http_code}' \
+                "$BASE_URL$route?__owag_propagation=$GITHUB_RUN_ID-$attempt")"
+              if [[ "$code" != 410 ]]; then
+                ready=false
+                break
+              fi
+            done
+            if [[ "$ready" = true ]]; then
+              echo "Production Functions are active on all four 410 probes."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::production Functions did not propagate within 90 seconds"
+          exit 2
 
       - name: Re-audit the immutable production deployment
         if: ${{ inputs.mode == 'production' }}
