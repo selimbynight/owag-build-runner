@@ -366,6 +366,10 @@ jobs:
           READY_INTERVAL_MS: 5000
           READY_CONSECUTIVE_PASSES: 2
           READY_FETCH_TIMEOUT_MS: 10000
+          READY_PROBE_CONCURRENCY: 2
+          READY_PROBE_MIN_INTERVAL_MS: 100
+          READY_PROBE_FETCH_RETRIES: 2
+          READY_PROBE_RETRY_BASE_MS: 500
         run: node scripts/wait-production-ready.mjs
 
       # Cette passe reste obligatoire même pour content_only : la gate de
@@ -379,6 +383,12 @@ jobs:
           SITE_HOST: ${{ env.HOST }}
           CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
           AUDIT_PHASE: production
+          # Netlify protège le domaine public contre les rafales : l'audit
+          # exhaustif espace ses départs tout en gardant deux requêtes en vol.
+          LIVE_AUDIT_CONCURRENCY: 2
+          LIVE_AUDIT_MIN_INTERVAL_MS: 200
+          LIVE_AUDIT_FETCH_RETRIES: 4
+          LIVE_AUDIT_FETCH_RETRY_BASE_MS: 1000
           # Une POP Cloudflare peut encore servir une route ancienne juste après
           # les deux passes ETag de la gate. L'audit complet est donc rejoué sur
           # une fenêtre courte ; la dernière erreur reste bloquante.
