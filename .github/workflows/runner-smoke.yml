@@ -24,4 +24,5 @@ jobs:
           test -f scripts/owag-build-callback.sh
           test -f scripts/live-audit.mjs
           test -f scripts/add-netlify-canonical-redirects.mjs
+          test -f scripts/verify-netlify-promotion.mjs
           echo "Frontend privé et scripts de publication accessibles."

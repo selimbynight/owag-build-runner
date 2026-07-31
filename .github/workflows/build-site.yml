@@ -329,28 +329,56 @@ jobs:
       # Cible secondaire strictement opt-in. --no-build garantit que Netlify
       # reçoit les mêmes fichiers de site que le candidat Cloudflare, avec le
       # seul overlay de redirections propre au fournisseur, sans reconstruire
-      # ni relire un snapshot CMS plus récent. La preuve OWAG ci-dessus reste
-      # exclusivement l'URL immuable Cloudflare.
-      - name: Deploy production → Netlify (opt-in)
+      # ni relire un snapshot CMS plus récent. Le premier upload reste un draft
+      # immuable : sa promotion atomique via l'API Restore ne recrée aucun
+      # déploiement et contourne les refus de création directe en production.
+      # La preuve OWAG ci-dessus reste exclusivement l'URL immuable Cloudflare.
+      - name: Deploy draft puis promotion → Netlify (opt-in)
         id: netlify
         if: env.NETLIFY_SITE_ID != ''
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
-          OUTPUT="$(mktemp)"
-          trap 'rm -f "$OUTPUT"' EXIT
+          DRAFT_OUTPUT="$(mktemp)"
+          RESTORE_OUTPUT="$(mktemp)"
+          SITE_OUTPUT="$(mktemp)"
+          trap 'rm -f "$DRAFT_OUTPUT" "$RESTORE_OUTPUT" "$SITE_OUTPUT"' EXIT
           echo "::add-mask::$NETLIFY_AUTH_TOKEN"
           npx --yes netlify-cli@27.0.1 deploy \
             --dir=dist \
             --no-build \
-            --prod \
             --json \
             --site="$NETLIFY_SITE_ID" \
-            --message="OWAG build $BUILD_ID / GitHub $GITHUB_SHA" > "$OUTPUT"
-          NETLIFY_RELEASE_URL="$(node scripts/resolve-netlify-deploy.mjs \
-            "$OUTPUT" "$NETLIFY_SITE_ID" "$NETLIFY_TECHNICAL_HOST")"
+            --message="OWAG draft $BUILD_ID / GitHub $GITHUB_SHA" > "$DRAFT_OUTPUT"
+          NETLIFY_DRAFT_URL="$(node scripts/resolve-netlify-deploy.mjs \
+            "$DRAFT_OUTPUT" "$NETLIFY_SITE_ID" "$NETLIFY_TECHNICAL_HOST")"
+          NETLIFY_DEPLOY_ID="$(jq -er '.deploy_id' "$DRAFT_OUTPUT")"
+          echo "Draft Netlify immuable attesté : $NETLIFY_DRAFT_URL"
+
+          if ! RESTORE_STATUS="$(curl --silent --show-error --fail-with-body \
+            --connect-timeout 10 --max-time 30 \
+            --output "$RESTORE_OUTPUT" --write-out '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            "https://api.netlify.com/api/v1/sites/$NETLIFY_SITE_ID/deploys/$NETLIFY_DEPLOY_ID/restore")"; then
+            echo "::error::promotion Netlify refusée (HTTP ${RESTORE_STATUS:-indisponible})"
+            exit 1
+          fi
+          case "$RESTORE_STATUS" in
+            200|201) ;;
+            *) echo "::error::promotion Netlify inattendue (HTTP $RESTORE_STATUS)"; exit 1 ;;
+          esac
+
+          curl --silent --show-error --fail-with-body \
+            --connect-timeout 10 --max-time 30 \
+            --output "$SITE_OUTPUT" \
+            -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            "https://api.netlify.com/api/v1/sites/$NETLIFY_SITE_ID"
+          NETLIFY_RELEASE_URL="$(node scripts/verify-netlify-promotion.mjs \
+            "$DRAFT_OUTPUT" "$RESTORE_OUTPUT" "$SITE_OUTPUT" \
+            "$NETLIFY_SITE_ID" "$NETLIFY_TECHNICAL_HOST")"
           echo "url=$NETLIFY_RELEASE_URL" >> "$GITHUB_OUTPUT"
-          echo "Déploiement Netlify immuable attesté : $NETLIFY_RELEASE_URL"
+          echo "Promotion Netlify attestée : $NETLIFY_RELEASE_URL"
 
       # La propagation du domaine public peut avancer route par route :
       # l'accueil peut être à jour avant robots.txt, les sitemaps ou certaines
