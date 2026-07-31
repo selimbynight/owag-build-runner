@@ -247,7 +247,12 @@ jobs:
           SITE_HOST: ${{ env.HOST }}
           CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
           AUDIT_PHASE: candidate
-        run: node scripts/live-audit.mjs
+          # L'URL immuable est annoncée avant que toutes les routes Functions
+          # soient nécessairement visibles sur chaque POP. On garde le même
+          # audit exhaustif, avec une courte fenêtre bornée de convergence.
+          LIVE_AUDIT_MAX_ATTEMPTS: 4
+          LIVE_AUDIT_RETRY_DELAY_MS: 5000
+        run: node scripts/retry-live-audit.mjs
 
       - name: Intention OWAG + deploy production → Cloudflare Pages
         id: deploy
