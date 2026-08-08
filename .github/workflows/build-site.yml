@@ -151,24 +151,29 @@ jobs:
             fi
           fi
 
-      - name: Guard — fraîcheur et cible du snapshot CMS
+      - name: Capturer le snapshot CMS immuable avant build
         id: snapshot
+        env:
+          SITE_HOST: ${{ env.HOST }}
+          LIVE_AUDIT_REFERENCE_PATH: ${{ runner.temp }}/owag-publication-${{ github.run_id }}-${{ github.run_attempt }}.json
         run: |
-          CALLBACK_TOKEN="$(jq -er '.client_payload.callback_token // empty' "$GITHUB_EVENT_PATH")"
-          echo "::add-mask::$CALLBACK_TOKEN"
           [ "$CMS_ORIGIN" = "https://app.owag.fr" ] || { echo "::error::origine CMS non autorisée"; exit 1; }
-          printf '%s' "$CALLBACK_TOKEN" | grep -Eq '^[A-Za-z0-9_-]{43}$' || { echo "::error::token callback absent/invalide"; exit 1; }
           printf '%s' "$EXPECTED_CONTENT_REVISION" | grep -Eq '^[0-9]+$' || { echo "::error::révision attendue invalide"; exit 1; }
-          CONFIG="$(curl --fail --silent --show-error --connect-timeout 10 --max-time 30 --get \
-            --data-urlencode "host=$HOST" --data-urlencode "_cb=build-$BUILD_ID" \
-            "$CMS_ORIGIN/api/public/site-config")"
-          OBSERVED="$(printf '%s' "$CONFIG" | jq -er '.data.contentRevision | select(type == "number" and floor == . and . >= 0)')"
+          REPORT="$(node scripts/capture-publication-snapshot.mjs)"
+          OBSERVED="$(printf '%s' "$REPORT" | jq -er '.contentRevision | select(type == "number" and floor == . and . >= 0)')"
+          DIGEST="$(printf '%s' "$REPORT" | jq -er '.digest | select(test("^[0-9a-f]{64}$"))')"
+          DATASET_COUNT="$(printf '%s' "$REPORT" | jq -er '.datasetCount')"
           [ "$OBSERVED" -ge "$EXPECTED_CONTENT_REVISION" ] || {
             echo "::error::snapshot CMS obsolète ($OBSERVED < $EXPECTED_CONTENT_REVISION)"
             exit 1
           }
+          [ "$DATASET_COUNT" = "8" ] || { echo "::error::snapshot CMS incomplet ($DATASET_COUNT/8)"; exit 1; }
+          echo "Snapshot CMS figé : révision $OBSERVED, 8 datasets, digest $DIGEST"
           echo "OBSERVED_CONTENT_REVISION=$OBSERVED" >> "$GITHUB_ENV"
           echo "observed_content_revision=$OBSERVED" >> "$GITHUB_OUTPUT"
+          echo "reference_path=$LIVE_AUDIT_REFERENCE_PATH" >> "$GITHUB_OUTPUT"
+          echo "reference_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
 
       - name: Guard — pas de marqueur de câblage CMS non résolu (G-STUB)
         # Un site qui n'a jamais fini son câblage CMS (stub laissé par erreur)
@@ -200,6 +205,9 @@ jobs:
         env:
           PUBLIC_CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
           PUBLIC_SITE_HOST: ${{ env.HOST }}
+          OWAG_REQUIRE_PUBLICATION_SNAPSHOT: 'true'
+          LIVE_AUDIT_REFERENCE_PATH: ${{ steps.snapshot.outputs.reference_path }}
+          LIVE_AUDIT_REFERENCE_DIGEST: ${{ steps.snapshot.outputs.reference_digest }}
         run: npm run build
 
       - name: Ensure Cloudflare Pages project exists
@@ -246,6 +254,8 @@ jobs:
           PAGES_URL: ${{ steps.audit-origin.outputs.pages_url }}
           SITE_HOST: ${{ env.HOST }}
           CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
+          LIVE_AUDIT_REFERENCE_PATH: ${{ steps.snapshot.outputs.reference_path }}
+          LIVE_AUDIT_REFERENCE_DIGEST: ${{ steps.snapshot.outputs.reference_digest }}
           AUDIT_PHASE: candidate
           # L'URL immuable est annoncée avant que toutes les routes Functions
           # soient nécessairement visibles sur chaque POP. On garde le même
@@ -410,6 +420,8 @@ jobs:
           NETLIFY_TECHNICAL_HOST: ${{ env.NETLIFY_TECHNICAL_HOST }}
           SITE_HOST: ${{ env.HOST }}
           CMS_ORIGIN: ${{ env.CMS_ORIGIN }}
+          LIVE_AUDIT_REFERENCE_PATH: ${{ steps.snapshot.outputs.reference_path }}
+          LIVE_AUDIT_REFERENCE_DIGEST: ${{ steps.snapshot.outputs.reference_digest }}
           AUDIT_PHASE: production
           # Netlify protège le domaine public contre les rafales : l'audit
           # exhaustif espace ses départs tout en gardant deux requêtes en vol.
